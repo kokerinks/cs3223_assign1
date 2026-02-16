@@ -65,23 +65,23 @@ typedef struct {
     int head;       /* buf_id of the head of the queue */
     int tail;       /* buf_id of the tail of the queue */
     int next;       /* buf_id of the clock hand */
-    
-    /* These arrays store the "pointers" to neighboring buf_ids */
-    int next_ptr[NBuffers]; 
-    int prev_ptr[NBuffers];
 } YAClockStrategyControl;
 
 /* Pointers to shared state */
 static BufferStrategyControl *StrategyControl = NULL;
 static YAClockStrategyControl *YAClockControl = NULL;
 
+/* These arrays store the "pointers" to neighboring buf_ids (allocated in shared memory) */
+static int *yaclock_next_ptr = NULL;
+static int *yaclock_prev_ptr = NULL;
+
 void removeBufferFromYAClock(int buf_id); /* cs3223 */
 void appendBufferToYAClock(int buf_id); /* cs3223 */
 
 void removeBufferFromYAClock(int buf_id)
 {
-    int bef = YAClockControl->prev_ptr[buf_id];
-    int aft = YAClockControl->next_ptr[buf_id];
+    int bef = yaclock_prev_ptr[buf_id];
+    int aft = yaclock_next_ptr[buf_id];
 
     // Not in queue
     if (bef == -1 && aft == -1)
@@ -95,8 +95,8 @@ void removeBufferFromYAClock(int buf_id)
     }
     else
     {
-        YAClockControl->next_ptr[bef] = aft;
-        YAClockControl->prev_ptr[aft] = bef;
+        yaclock_next_ptr[bef] = aft;
+        yaclock_prev_ptr[aft] = bef;
 
         if (YAClockControl->head == buf_id)
             YAClockControl->head = aft;
@@ -105,15 +105,15 @@ void removeBufferFromYAClock(int buf_id)
             YAClockControl->tail = bef;
     }
 
-    YAClockControl->prev_ptr[buf_id] = -1;
-    YAClockControl->next_ptr[buf_id] = -1;
+    yaclock_prev_ptr[buf_id] = -1;
+    yaclock_next_ptr[buf_id] = -1;
 }
 
 void appendBufferToYAClock(int buf_id)
 {
     // If already in queue, do nothing
-    if (YAClockControl->prev_ptr[buf_id] != -1 ||
-        YAClockControl->next_ptr[buf_id] != -1)
+    if (yaclock_prev_ptr[buf_id] != -1 ||
+        yaclock_next_ptr[buf_id] != -1)
     {
         return;
     }
@@ -124,8 +124,8 @@ void appendBufferToYAClock(int buf_id)
         YAClockControl->head = buf_id;
         YAClockControl->tail = buf_id;
 
-        YAClockControl->prev_ptr[buf_id] = buf_id;
-        YAClockControl->next_ptr[buf_id] = buf_id;
+        yaclock_prev_ptr[buf_id] = buf_id;
+        yaclock_next_ptr[buf_id] = buf_id;
     }
     else
     {
@@ -133,12 +133,12 @@ void appendBufferToYAClock(int buf_id)
         int head = YAClockControl->head;
 
         // Link new node
-        YAClockControl->prev_ptr[buf_id] = old_tail;
-        YAClockControl->next_ptr[buf_id] = head;
+        yaclock_prev_ptr[buf_id] = old_tail;
+        yaclock_next_ptr[buf_id] = head;
 
         // Fix neighbors
-        YAClockControl->next_ptr[old_tail] = buf_id;
-        YAClockControl->prev_ptr[head] = buf_id;
+        yaclock_next_ptr[old_tail] = buf_id;
+        yaclock_prev_ptr[head] = buf_id;
 
         // Update tail
         YAClockControl->tail = buf_id;
@@ -211,7 +211,7 @@ StrategyAccessBuffer(int buf_id, int event_num)
 		case 3:
 			// If F is unpinned and F’s refBit = 0, next is updated to point to the buffer frame after F in the queue, and F is moved to the tail of the queue. Thus, the search terminates with F being selected as the victim buffer frame for P.
 			if (YAClockControl->next == buf_id) {
-				YAClockControl->next = YAClockControl->next_ptr[buf_id];
+				YAClockControl->next = yaclock_next_ptr[buf_id];
 			}
 			removeBufferFromYAClock(buf_id);
 			appendBufferToYAClock(buf_id);
@@ -220,7 +220,7 @@ StrategyAccessBuffer(int buf_id, int event_num)
 		case 4:
 			// If next is pointing at F, next is updated to point to the buffer frame after F in the queue.
 			if (YAClockControl->next == buf_id) {
-				YAClockControl->next = YAClockControl->next_ptr[buf_id];
+				YAClockControl->next = yaclock_next_ptr[buf_id];
 			}
 
 			// F is removed from the queue.
@@ -613,6 +613,10 @@ StrategyShmemSize(void)
 
 	size = add_size(size, MAXALIGN(sizeof(YAClockStrategyControl)));
 
+	/* cs3223: size of YAClock next_ptr and prev_ptr arrays */
+	size = add_size(size, mul_size(NBuffers, sizeof(int)));
+	size = add_size(size, mul_size(NBuffers, sizeof(int)));
+
 	return size;
 }
 
@@ -685,6 +689,16 @@ StrategyInitialize(bool init)
 						sizeof(YAClockStrategyControl),
 						&found);
 
+	yaclock_next_ptr = (int *)
+		ShmemInitStruct("YAClock Next Pointers",
+						NBuffers * sizeof(int),
+						&found);
+
+	yaclock_prev_ptr = (int *)
+		ShmemInitStruct("YAClock Prev Pointers",
+						NBuffers * sizeof(int),
+						&found);
+
 	if (!found)
 	{
 		Assert(init);
@@ -695,8 +709,8 @@ StrategyInitialize(bool init)
 
 		for (int i = 0; i < NBuffers; i++)
 		{
-			YAClockControl->next_ptr[i] = -1;
-			YAClockControl->prev_ptr[i] = -1;
+			yaclock_next_ptr[i] = -1;
+			yaclock_prev_ptr[i] = -1;
 		}
 	}
 	else
