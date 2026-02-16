@@ -61,8 +61,90 @@ typedef struct
 	int			bgwprocno;
 } BufferStrategyControl;
 
+typedef struct {
+    int head;       /* buf_id of the head of the queue */
+    int tail;       /* buf_id of the tail of the queue */
+    int next;       /* buf_id of the clock hand */
+    
+    /* These arrays store the "pointers" to neighboring buf_ids */
+    int next_ptr[NBuffers]; 
+    int prev_ptr[NBuffers];
+} YAClockStrategyControl;
+
 /* Pointers to shared state */
 static BufferStrategyControl *StrategyControl = NULL;
+static YAClockStrategyControl *YAClockControl = NULL;
+
+void removeBufferFromYAClock(int buf_id); /* cs3223 */
+void appendBufferToYAClock(int buf_id); /* cs3223 */
+
+void removeBufferFromYAClock(int buf_id)
+{
+    int bef = YAClockControl->prev_ptr[buf_id];
+    int aft = YAClockControl->next_ptr[buf_id];
+
+    // Not in queue
+    if (bef == -1 && aft == -1)
+        return;
+
+    // Single element case
+    if (bef == buf_id && aft == buf_id)
+    {
+        YAClockControl->head = -1;
+        YAClockControl->tail = -1;
+    }
+    else
+    {
+        YAClockControl->next_ptr[bef] = aft;
+        YAClockControl->prev_ptr[aft] = bef;
+
+        if (YAClockControl->head == buf_id)
+            YAClockControl->head = aft;
+
+        if (YAClockControl->tail == buf_id)
+            YAClockControl->tail = bef;
+    }
+
+    YAClockControl->prev_ptr[buf_id] = -1;
+    YAClockControl->next_ptr[buf_id] = -1;
+}
+
+void appendBufferToYAClock(int buf_id)
+{
+    // If already in queue, do nothing
+    if (YAClockControl->prev_ptr[buf_id] != -1 ||
+        YAClockControl->next_ptr[buf_id] != -1)
+    {
+        return;
+    }
+
+    // Empty queue case
+    if (YAClockControl->head == -1)
+    {
+        YAClockControl->head = buf_id;
+        YAClockControl->tail = buf_id;
+
+        YAClockControl->prev_ptr[buf_id] = buf_id;
+        YAClockControl->next_ptr[buf_id] = buf_id;
+    }
+    else
+    {
+        int old_tail = YAClockControl->tail;
+        int head = YAClockControl->head;
+
+        // Link new node
+        YAClockControl->prev_ptr[buf_id] = old_tail;
+        YAClockControl->next_ptr[buf_id] = head;
+
+        // Fix neighbors
+        YAClockControl->next_ptr[old_tail] = buf_id;
+        YAClockControl->prev_ptr[head] = buf_id;
+
+        // Update tail
+        YAClockControl->tail = buf_id;
+    }
+}
+
 
 /*
  * Private (non-shared) state for managing a ring of shared buffers to re-use.
@@ -100,6 +182,8 @@ static void AddBufferToRing(BufferAccessStrategy strategy,
 
 void StrategyAccessBuffer(int buf_id, int event_num); /* cs3223 */
 
+void SetBufferRefBit(int buf_id, int value); /* cs3223 */
+
 /*
 cs3223
 StrategyAccessBuffer  -- update YACLOCK's data structures when a buffer page is accessed.
@@ -108,11 +192,60 @@ Note that event_num must be 1, 2, 3, or 4 corresponding to the four events in YA
 void
 StrategyAccessBuffer(int buf_id, int event_num)
 {
-	elog(ERROR, "StrategyAccessBuffer: Not implemented!");
+	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+	
+	switch(event_num) {
+		case 1: // page already exists in buffer
+			// Case 1: If P is already in some buffer frame F, F’s refBit is updated to 1.
+			SetBufferRefBit(buf_id, 1);
+			break;	
+
+		case 2:	// buffer freed from free list
+			/* 1. Set refBit to 0 */
+            SetBufferRefBit(buf_id, 0);
+
+            /* 2. Add buf_id to the TAIL of the queue */
+			appendBufferToYAClock(buf_id);
+			break;
+
+		case 3:
+			// If F is unpinned and F’s refBit = 0, next is updated to point to the buffer frame after F in the queue, and F is moved to the tail of the queue. Thus, the search terminates with F being selected as the victim buffer frame for P.
+			if (YAClockControl->next == buf_id) {
+				YAClockControl->next = YAClockControl->next_ptr[buf_id];
+			}
+			removeBufferFromYAClock(buf_id);
+			appendBufferToYAClock(buf_id);
+			break;
+
+		case 4:
+			// If next is pointing at F, next is updated to point to the buffer frame after F in the queue.
+			if (YAClockControl->next == buf_id) {
+				YAClockControl->next = YAClockControl->next_ptr[buf_id];
+			}
+
+			// F is removed from the queue.
+			removeBufferFromYAClock(buf_id);
+
+			break;
+	}
+}
+
+void SetBufferRefBit(int buf_id, int value)
+{
+	BufferDesc *buf = GetBufferDescriptor(buf_id);
+	uint32		buf_state;
+
+	buf_state = LockBufHdr(buf);
+
+	/* Clear existing usage count and set the new value */
+	buf_state &= ~BUF_USAGECOUNT_MASK;
+	buf_state += (uint32) value * BUF_USAGECOUNT_ONE;
+
+	UnlockBufHdr(buf, buf_state);
 }
 
 
-/*
+/*`
  * ClockSweepTick - Helper routine for StrategyGetBuffer()
  *
  * Move the clock hand one buffer ahead of its current position and return the
@@ -318,6 +451,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
+				StrategyAccessBuffer(buf->buf_id, 2); /* cs3223 */
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -350,6 +484,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 				/* Found a usable buffer */
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
+				StrategyAccessBuffer(buf->buf_id, 3); /* cs3223 */
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -376,6 +511,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 void
 StrategyFreeBuffer(BufferDesc *buf)
 {
+	StrategyAccessBuffer(buf->buf_id, 4); /* cs3223 */
+
 	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 
 	/*
@@ -474,6 +611,8 @@ StrategyShmemSize(void)
 	/* size of the shared replacement strategy control block */
 	size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
+	size = add_size(size, MAXALIGN(sizeof(YAClockStrategyControl)));
+
 	return size;
 }
 
@@ -534,6 +673,31 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwprocno = -1;
+	}
+	else
+		Assert(!init);
+
+	/*
+	 * cs3223: Get or create the shared YAClock control block
+	 */
+	YAClockControl = (YAClockStrategyControl *)
+		ShmemInitStruct("YAClock Strategy Status",
+						sizeof(YAClockStrategyControl),
+						&found);
+
+	if (!found)
+	{
+		Assert(init);
+
+		YAClockControl->head = -1;
+		YAClockControl->tail = -1;
+		YAClockControl->next = -1;
+
+		for (int i = 0; i < NBuffers; i++)
+		{
+			YAClockControl->next_ptr[i] = -1;
+			YAClockControl->prev_ptr[i] = -1;
+		}
 	}
 	else
 		Assert(!init);
