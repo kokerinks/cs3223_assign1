@@ -92,6 +92,7 @@ void removeBufferFromYAClock(int buf_id)
     {
         YAClockControl->head = -1;
         YAClockControl->tail = -1;
+        YAClockControl->next = -1;
     }
     else
     {
@@ -103,6 +104,9 @@ void removeBufferFromYAClock(int buf_id)
 
         if (YAClockControl->tail == buf_id)
             YAClockControl->tail = bef;
+
+        if (YAClockControl->next == buf_id)
+            YAClockControl->next = aft;
     }
 
     yaclock_prev_ptr[buf_id] = -1;
@@ -123,6 +127,7 @@ void appendBufferToYAClock(int buf_id)
     {
         YAClockControl->head = buf_id;
         YAClockControl->tail = buf_id;
+        YAClockControl->next = buf_id;
 
         yaclock_prev_ptr[buf_id] = buf_id;
         yaclock_next_ptr[buf_id] = buf_id;
@@ -206,6 +211,9 @@ StrategyAccessBuffer(int buf_id, int event_num)
 
             /* 2. Add buf_id to the TAIL of the queue */
 			appendBufferToYAClock(buf_id);
+
+			if (YAClockControl->next == -1)
+        		YAClockControl->next = buf_id;  // initialize clock hand
 			break;
 
 		case 3:
@@ -228,6 +236,7 @@ StrategyAccessBuffer(int buf_id, int event_num)
 
 			break;
 	}
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 }
 
 void SetBufferRefBit(int buf_id, int value)
@@ -437,6 +446,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * we check out this buffer.
 			 */
 			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			StrategyAccessBuffer(buf->buf_id, 2); /* cs3223 */
 
 			/*
 			 * If the buffer is pinned or has a nonzero usage_count, we cannot
@@ -451,7 +461,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
-				StrategyAccessBuffer(buf->buf_id, 2); /* cs3223 */
 				*buf_state = local_buf_state;
 				return buf;
 			}
