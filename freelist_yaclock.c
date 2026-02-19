@@ -162,7 +162,7 @@ StrategyAccessBuffer(int buf_id, int event_num)
 {
 	BufferDesc *buf;
 
-	Assert(buf_id >= 0 && buf_id < NBuffers);
+	Assert(event_num == 3 || (buf_id >= 0 && buf_id < NBuffers));
 
 	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 
@@ -178,53 +178,64 @@ StrategyAccessBuffer(int buf_id, int event_num)
 			break;
 		case 3:
 			{
-				int	victim_id = -1;
-				int	current;
+				int			current;
+				uint32		buf_state;
+				int			refcount;
+				int			trycounter = NBuffers;
 
 				if (StrategyControl->yaclockNext == -1)
-					StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-
-				current = StrategyControl->yaclockNext;
-
-				while (current != -1)
 				{
-					buf = GetBufferDescriptor(current);
-					uint32		buf_state = LockBufHdr(buf);
-					int			refcount = BUF_STATE_GET_REFCOUNT(buf_state);
+					if (StrategyControl->yaclockQueueHead == -1)
+					{
+						SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+						elog(ERROR, "YACLOCK queue is empty but free list is also empty");
+					}
+					StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+				}
 
+				for (;;)
+				{
+					current = StrategyControl->yaclockNext;
+
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+					buf = GetBufferDescriptor(current);
+					buf_state = LockBufHdr(buf);
+					refcount = BUF_STATE_GET_REFCOUNT(buf_state);
 					UnlockBufHdr(buf, buf_state);
+
+					SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 
 					if (refcount == 0)
 					{
-						if (YAClockBuffers[current].refBit == 0)
+						if (YAClockBuffers[current].refBit == 1)
 						{
-							victim_id = current;
-
+							YAClockBuffers[current].refBit = 0;
 							StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
 							if (StrategyControl->yaclockNext == -1)
 								StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-
-							YAClockRemoveFromQueue(victim_id);
-
-							YAClockAddToTail(victim_id);
-
-							break;
+							trycounter = NBuffers;
 						}
 						else
 						{
-							YAClockBuffers[current].refBit = 0;
+							StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
+							if (StrategyControl->yaclockNext == -1)
+								StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+							YAClockRemoveFromQueue(current);
+							YAClockAddToTail(current);
+							break;
 						}
 					}
-
-					current = YAClockBuffers[current].nextInQueue;
-					if (current == -1)
-						current = StrategyControl->yaclockQueueHead;
-
-					StrategyControl->yaclockNext = current;
-
-					if (current == StrategyControl->yaclockNext && victim_id == -1)
+					else
 					{
-						break;
+						StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
+						if (StrategyControl->yaclockNext == -1)
+							StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+						if (--trycounter == 0)
+						{
+							SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+							elog(ERROR, "no unpinned buffers available");
+						}
 					}
 				}
 			}
@@ -353,7 +364,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 	*from_ring = false;
@@ -469,79 +479,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		}
 	}
 
-	trycounter = NBuffers;
-	for (;;)
-	{
-		int			victim_id;
+	StrategyAccessBuffer(-1, 3);
 
-		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+	buf = GetBufferDescriptor(StrategyControl->yaclockQueueTail);
+	local_buf_state = LockBufHdr(buf);
 
-		if (StrategyControl->yaclockNext == -1)
-		{
-			StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-		}
-
-		victim_id = StrategyControl->yaclockNext;
-		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-
-		buf = GetBufferDescriptor(victim_id);
-
-		local_buf_state = LockBufHdr(buf);
-
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
-		{
-			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-			
-			if (YAClockBuffers[victim_id].refBit == 1)
-			{
-				YAClockBuffers[victim_id].refBit = 0;
-				
-				StrategyControl->yaclockNext = YAClockBuffers[victim_id].nextInQueue;
-				if (StrategyControl->yaclockNext == -1)
-					StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-				
-				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-				trycounter = NBuffers;
-			}
-			else
-			{
-				StrategyControl->yaclockNext = YAClockBuffers[victim_id].nextInQueue;
-				if (StrategyControl->yaclockNext == -1)
-					StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-
-				YAClockRemoveFromQueue(victim_id);
-
-				YAClockAddToTail(victim_id);
-
-				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-
-				/* Found a usable buffer */
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
-				return buf;
-			}
-		}
-		else
-		{
-			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-			StrategyControl->yaclockNext = YAClockBuffers[victim_id].nextInQueue;
-			if (StrategyControl->yaclockNext == -1)
-				StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-
-			if (--trycounter == 0)
-			{
-				/*
-				 * We've scanned all the buffers without making any state changes,
-				 * so all the buffers are pinned (or were when we looked at them).
-				 */
-				UnlockBufHdr(buf, local_buf_state);
-				elog(ERROR, "no unpinned buffers available");
-			}
-		}
-		UnlockBufHdr(buf, local_buf_state);
-	}
+	if (strategy != NULL)
+		AddBufferToRing(strategy, buf);
+	*buf_state = local_buf_state;
+	return buf;
 }
 
 /*
