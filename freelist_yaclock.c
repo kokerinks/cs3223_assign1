@@ -175,7 +175,6 @@ StrategyAccessBuffer(int buf_id, int event_num)
 			YAClockAddToTail(buf_id);
 			break;
 		case 3:
-			/* Queue manipulation only: remove from current position, add to tail */
 			YAClockRemoveFromQueue(buf_id);
 			YAClockAddToTail(buf_id);
 			break;
@@ -416,10 +415,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			}
 			UnlockBufHdr(buf, local_buf_state);
 		}
-	}
-
-	/* YAClock: find victim buffer by scanning the queue */
-	{
+	} else {
 		int			current;
 		int			trycounter = NBuffers;
 		int			refcount;
@@ -482,7 +478,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			}
 		}
 
-		/* Let StrategyAccessBuffer handle the queue manipulation */
 		StrategyAccessBuffer(current, 3);
 
 		buf = GetBufferDescriptor(current);
