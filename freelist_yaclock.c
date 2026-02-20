@@ -160,9 +160,7 @@ YAClockAddToTail(int buf_id)
 void
 StrategyAccessBuffer(int buf_id, int event_num)
 {
-	BufferDesc *buf;
-
-	Assert(event_num == 3 || (buf_id >= 0 && buf_id < NBuffers));
+	Assert(buf_id >= 0 && buf_id < NBuffers);
 
 	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 
@@ -177,68 +175,9 @@ StrategyAccessBuffer(int buf_id, int event_num)
 			YAClockAddToTail(buf_id);
 			break;
 		case 3:
-			{
-				int			current;
-				uint32		buf_state;
-				int			refcount;
-				int			trycounter = NBuffers;
-
-				if (StrategyControl->yaclockNext == -1)
-				{
-					if (StrategyControl->yaclockQueueHead == -1)
-					{
-						SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-						elog(ERROR, "YACLOCK queue is empty but free list is also empty");
-					}
-					StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-				}
-
-				for (;;)
-				{
-					current = StrategyControl->yaclockNext;
-
-					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-
-					buf = GetBufferDescriptor(current);
-					buf_state = LockBufHdr(buf);
-					refcount = BUF_STATE_GET_REFCOUNT(buf_state);
-					UnlockBufHdr(buf, buf_state);
-
-					SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-
-					if (refcount == 0)
-					{
-						if (YAClockBuffers[current].refBit == 1)
-						{
-							YAClockBuffers[current].refBit = 0;
-							StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
-							if (StrategyControl->yaclockNext == -1)
-								StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-							trycounter = NBuffers;
-						}
-						else
-						{
-							StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
-							if (StrategyControl->yaclockNext == -1)
-								StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-							YAClockRemoveFromQueue(current);
-							YAClockAddToTail(current);
-							break;
-						}
-					}
-					else
-					{
-						StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
-						if (StrategyControl->yaclockNext == -1)
-							StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
-						if (--trycounter == 0)
-						{
-							SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-							elog(ERROR, "no unpinned buffers available");
-						}
-					}
-				}
-			}
+			/* Queue manipulation only: remove from current position, add to tail */
+			YAClockRemoveFromQueue(buf_id);
+			YAClockAddToTail(buf_id);
 			break;
 
 		case 4:
@@ -479,15 +418,81 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		}
 	}
 
-	StrategyAccessBuffer(-1, 3);
+	/* YAClock: find victim buffer by scanning the queue */
+	{
+		int			current;
+		int			trycounter = NBuffers;
+		int			refcount;
 
-	buf = GetBufferDescriptor(StrategyControl->yaclockQueueTail);
-	local_buf_state = LockBufHdr(buf);
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 
-	if (strategy != NULL)
-		AddBufferToRing(strategy, buf);
-	*buf_state = local_buf_state;
-	return buf;
+		if (StrategyControl->yaclockNext == -1)
+		{
+			if (StrategyControl->yaclockQueueHead == -1)
+			{
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				elog(ERROR, "YACLOCK queue is empty but free list is also empty");
+			}
+			StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+		}
+
+		for (;;)
+		{
+			current = StrategyControl->yaclockNext;
+
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			buf = GetBufferDescriptor(current);
+			local_buf_state = LockBufHdr(buf);
+			refcount = BUF_STATE_GET_REFCOUNT(local_buf_state);
+			UnlockBufHdr(buf, local_buf_state);
+
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+			if (refcount == 0)
+			{
+				if (YAClockBuffers[current].refBit == 1)
+				{
+					YAClockBuffers[current].refBit = 0;
+					StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
+					if (StrategyControl->yaclockNext == -1)
+						StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+					trycounter = NBuffers;
+				}
+				else
+				{
+					/* Found victim: advance yaclockNext past it */
+					StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
+					if (StrategyControl->yaclockNext == -1)
+						StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+					break;
+				}
+			}
+			else
+			{
+				StrategyControl->yaclockNext = YAClockBuffers[current].nextInQueue;
+				if (StrategyControl->yaclockNext == -1)
+					StrategyControl->yaclockNext = StrategyControl->yaclockQueueHead;
+				if (--trycounter == 0)
+				{
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+					elog(ERROR, "no unpinned buffers available");
+				}
+			}
+		}
+
+		/* Let StrategyAccessBuffer handle the queue manipulation */
+		StrategyAccessBuffer(current, 3);
+
+		buf = GetBufferDescriptor(current);
+		local_buf_state = LockBufHdr(buf);
+
+		if (strategy != NULL)
+			AddBufferToRing(strategy, buf);
+		*buf_state = local_buf_state;
+		return buf;
+	}
 }
 
 /*
